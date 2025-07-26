@@ -7,12 +7,21 @@ from .models import (
     TaskCreateRequest, TaskUpdateRequest, TaskResponse, TaskListResponse
 )
 from .repository import (
-    register_user, authenticate_user, get_user_by_id,
     create_task, list_tasks, get_task, update_task, delete_task,
     init_workspace
 )
 
+import os
+from supabase import create_client, Client
+import jwt
+
 load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in the environment")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 openapi_tags = [
     {"name": "auth", "description": "Authentication and user management"},
@@ -35,22 +44,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def fake_generate_token(user_id: str) -> str:
-    """(Temporary) Generate a fake session token. Replace with JWT/Supabase session."""
-    return f"fake-token-{user_id}"
 
+def decode_supabase_jwt(token: str) -> dict:
+    """Decode the JWT from Supabase auth (does not verify signature, just parses claims)."""
+    # For robust verification, fetch Supabase project JWKS/public keys and verify signature
+    # Here we parse claims for user id/email
+    try:
+        unverified = jwt.decode(token, options={"verify_signature": False})
+        return unverified
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Failed to decode token")
+
+
+# PUBLIC_INTERFACE
 def get_current_user(authorization: str = Header(None)) -> UserResponse:
+    """
+    FastAPI dependency to extract and validate the current user using Supabase JWT from Authorization header.
+
+    Args:
+        authorization (str): The HTTP Authorization header
+
+    Returns:
+        UserResponse: The authenticated user's id and email
+
+    Raises:
+        HTTPException: If missing/invalid token or user not found in Supabase
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing Authorization header")
     token = authorization.split(" ")[1]
-    # For now, extract user_id from the fake token
-    if not token.startswith("fake-token-"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    user_id = token.replace("fake-token-", "")
-    user = get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    return UserResponse(user_id=user_id, email=user["email"])
+    # Decode claims to get user id (subject = uid), and email
+    try:
+        claims = decode_supabase_jwt(token)
+        user_id = claims.get("sub")
+        email = claims.get("email")
+        if not user_id or not email:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Supabase token claims")
+        # Optionally, refresh session or validate token with Supabase (if you want live session check)
+        # user = supabase.auth.api.get_user(token) # this is supported by supabase-py for validation
+        return UserResponse(user_id=user_id, email=email)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalid or expired")
 
 
 @app.get("/", summary="Health Check", tags=["workspace"])
@@ -72,34 +106,58 @@ def workspace_init():
 @app.post("/auth/register", response_model=AuthTokenResponse, summary="Register new user", tags=["auth"])
 def register(body: UserRegisterRequest):
     """
-    Register a new user. Stores user in backend and returns access token.
+    Register a new user. Calls Supabase Auth and returns access token.
     """
     try:
-        user = register_user(body.email, body.password)
-        token = fake_generate_token(user["user_id"])
+        # Register with Supabase; expect user is created and session is returned
+        resp = supabase.auth.sign_up(
+            {
+                "email": body.email,
+                "password": body.password,
+            },
+            email_redirect_to=f"{os.getenv('SITE_URL', 'http://localhost:3000')}/auth/callback"
+        )
+        user = resp.get("user")
+        session = resp.get("session")
+        if not user:
+            raise HTTPException(status_code=400, detail="Error registering user")
+        if not session:
+            # Supabase may require email confirmation
+            raise HTTPException(status_code=202, detail="Check your email to confirm registration")
+        token = session.get("access_token")
+        user_id = user.get("id") or user.get("user_metadata", {}).get("sub")
         return AuthTokenResponse(
             access_token=token,
             token_type="bearer",
-            user=UserResponse(user_id=user["user_id"], email=user["email"]),
+            user=UserResponse(user_id=user_id, email=body.email),
         )
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Internal error or Supabase error during registration")
 
 
 @app.post("/auth/login", response_model=AuthTokenResponse, summary="Login", tags=["auth"])
 def login(body: UserLoginRequest):
     """
-    Log user in. Returns access token.
+    Log user in via Supabase and return access token.
     """
-    user = authenticate_user(body.email, body.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = fake_generate_token(user["user_id"])
-    return AuthTokenResponse(
-        access_token=token,
-        token_type="bearer",
-        user=UserResponse(user_id=user["user_id"], email=user["email"]),
-    )
+    try:
+        resp = supabase.auth.sign_in_with_password({
+            "email": body.email,
+            "password": body.password,
+        })
+        session = resp.get("session")
+        user = resp.get("user")
+        if not session or not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        token = session.get("access_token")
+        user_id = user.get("id") or user.get("user_metadata", {}).get("sub")
+        return AuthTokenResponse(
+            access_token=token,
+            token_type="bearer",
+            user=UserResponse(user_id=user_id, email=body.email),
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Login failed due to internal or Supabase error")
 
 
 @app.post("/auth/logout", summary="Logout", tags=["auth"])

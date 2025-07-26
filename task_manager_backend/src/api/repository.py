@@ -3,44 +3,24 @@ import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
-# For demonstration purposes, this logic should later be replaced with Supabase/Postgres integration.
-# Here, a simple in-memory store is used. Replace with actual Supabase client logic per supabase.md.
+# Only task CRUD logic remains here. All authentication/user profile logic uses Supabase Auth ONLY!
+# If using Supabase DB for tasks, replace in-memory TASKS with DB queries.
 
 load_dotenv()
 
-# --- Mocked in-memory stores ---
-USERS = {}
 TASKS = {}
 
 def init_workspace():
     """Initialize workspace (mock). In reality, check/create required tables in Supabase."""
-    USERS.clear()
     TASKS.clear()
     return True
 
-# PUBLIC_INTERFACE
-def register_user(email: str, password: str) -> Dict[str, Any]:
-    """Registers a new user."""
-    if email in USERS:
-        raise ValueError("User already exists")
-    user_id = str(uuid.uuid4())
-    USERS[email] = {"user_id": user_id, "email": email, "password": password}
-    return USERS[email]
-
-# PUBLIC_INTERFACE
-def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
-    """Authenticates a user."""
-    user = USERS.get(email)
-    if not user or user["password"] != password:
-        return None
-    return user
+# --- User registration/authentication logic REMOVED from here; handled by supabase in main.py ---
 
 # PUBLIC_INTERFACE
 def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
-    """Fetch user by ID."""
-    for user in USERS.values():
-        if user["user_id"] == user_id:
-            return user
+    """Disabled: User lookup logic is now handled via Supabase Auth JWT.
+    This function is not used, present for backward compatibility."""
     return None
 
 # PUBLIC_INTERFACE
