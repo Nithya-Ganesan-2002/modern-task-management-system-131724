@@ -107,32 +107,72 @@ def workspace_init():
 def register(body: UserRegisterRequest):
     """
     Register a new user. Calls Supabase Auth and returns access token.
+    Returns error details if registration fails due to known issues like existing email.
     """
     try:
-        # Register with Supabase; expect user is created and session is returned
+        # Defensive check on redirect URL
+        email_redirect_to = os.getenv('SITE_URL', 'http://localhost:3000') + "/auth/callback"
+        # Call Supabase signup and capture raw response (may include error)
         resp = supabase.auth.sign_up(
             {
                 "email": body.email,
                 "password": body.password,
             },
-            email_redirect_to=f"{os.getenv('SITE_URL', 'http://localhost:3000')}/auth/callback"
+            email_redirect_to=email_redirect_to
         )
+
+        # Explicitly check error feedback from supabase-py
+        # supabase-py places errors in resp['error'], data in resp['user'], session in resp['session']
+        # More recent versions: user/session may be under ['data']
+        error = resp.get("error")
+        if error:
+            error_message = error.get("message") if isinstance(error, dict) else str(error)
+            # Most common Supabase error: 'User already registered'
+            # See https://github.com/supabase/supabase-py/issues/117 -- error may be string or dict!
+            if 'already registered' in error_message.lower() or 'User already registered' in error_message:
+                raise HTTPException(status_code=409, detail="Email address is already registered")
+            # Email format, password requirements, etc.
+            if 'invalid email' in error_message.lower():
+                raise HTTPException(status_code=422, detail="Invalid email address")
+            if '6 characters' in error_message.lower() or 'password' in error_message.lower():
+                raise HTTPException(status_code=422, detail="Password does not meet requirements")
+            # Generic fallback
+            raise HTTPException(status_code=400, detail=f"Supabase error: {error_message}")
+
         user = resp.get("user")
         session = resp.get("session")
+        # Sometimes in newer supabase-py, nested under data dict
+        if not user and resp.get("data"):
+            user = resp["data"].get("user")
+            session = resp["data"].get("session")
+
         if not user:
-            raise HTTPException(status_code=400, detail="Error registering user")
+            raise HTTPException(status_code=400, detail="Unknown error: No user returned from Supabase.")
+
         if not session:
-            # Supabase may require email confirmation
-            raise HTTPException(status_code=202, detail="Check your email to confirm registration")
+            # Supabase may require email confirmation: if so no session is included, but user is created
+            # NOTE: This is a 202 to indicate further action, not 400!
+            raise HTTPException(status_code=202, detail="Registration successful, please check your email to confirm.")
+
         token = session.get("access_token")
         user_id = user.get("id") or user.get("user_metadata", {}).get("sub")
+        if not token or not user_id:
+            raise HTTPException(status_code=400, detail="Supabase did not return access token or user id.")
+
         return AuthTokenResponse(
             access_token=token,
             token_type="bearer",
             user=UserResponse(user_id=user_id, email=body.email),
         )
-    except Exception:
-        raise HTTPException(status_code=400, detail="Internal error or Supabase error during registration")
+    except HTTPException:
+        raise  # Reraise FastAPI HTTP errors for proper API feedback
+    except Exception as ex:
+        import traceback
+        tb = traceback.format_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error during registration: {str(ex)}. Trace: {tb}"
+        )
 
 
 @app.post("/auth/login", response_model=AuthTokenResponse, summary="Login", tags=["auth"])
